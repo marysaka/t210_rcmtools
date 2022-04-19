@@ -1,4 +1,4 @@
-# t21_rcmtools
+# t210_rcmtools
 
 Some tools to interact with Tegra X1 RCM to handle download ane execution of images on the BPMP.
 
