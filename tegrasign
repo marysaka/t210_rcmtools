@@ -1,0 +1,64 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import xml.etree.ElementTree as ET
+from rcm import sbk_compute_hash
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--list", nargs=1)
+parser.add_argument("--key", nargs=1)
+parser.add_argument("--pubkeyhash", nargs=1)
+
+args = parser.parse_args()
+
+# TODO: read key file if valid file
+if os.path.exists(args.key[0]):
+    raise Exception("TODO")
+else:
+    key_data = bytes(16)
+
+input_xml_file_path = os.path.abspath(args.list[0])
+rcm_messages_path = os.path.dirname(input_xml_file_path)
+
+output_xml_file_name = os.path.splitext(input_xml_file_path)[0] + "_signed.xml"
+output_xml_file_path = os.path.join(rcm_messages_path, output_xml_file_name)
+
+
+tree = ET.parse(input_xml_file_path)
+root = tree.getroot()
+root.attrib["mode"] = "sbk"
+
+for files in root:
+    sbk_element = files.find("sbk")
+
+    if sbk_element is None:
+        continue
+
+    info = files.attrib
+    sbk_info = sbk_element.attrib
+
+    name = info["name"]
+    offset = int(info["offset"])
+    length = int(info["length"])
+
+    rcm_message_path = os.path.join(rcm_messages_path, name)
+
+    with open(rcm_message_path, "rb") as f:
+        rcm_message = f.read()
+
+    if "encrypt_file" in sbk_info:
+        # NOTE: not encrypted by this tool...
+        with open(os.path.join(rcm_messages_path, sbk_info["encrypt_file"]), "wb") as f:
+            f.write(rcm_message)
+
+    if "hash" in sbk_info:
+        with open(os.path.join(rcm_messages_path, sbk_info["hash"]), "wb") as f:
+            f.write(sbk_compute_hash(rcm_message, offset, length, key_data))
+
+ET.indent(root, space="\t")
+ET.ElementTree(root).write(output_xml_file_path, encoding="UTF-8", xml_declaration=True)
+
+# rcm_data = open("tmp/rcm_0.rcm", "rb").read()
+# open("test.hash", "wb").write(compute_hash(rcm_data, rcm.RCM21_RCM_MESSAGE_SECURE_START, len(rcm_data) - rcm.RCM21_RCM_MESSAGE_SECURE_START))

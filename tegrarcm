@@ -1,0 +1,223 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import sys
+from typing import List
+
+import rcm
+import xml.etree.cElementTree as ET
+import usb.core
+import usb.util
+
+from rcm import get_default_download_address, rcm_read_br_cid, rcm_transfer_message
+from utils import parse_any_int, parse_hex
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--listrcm", nargs=1)
+parser.add_argument("--updatesig", nargs=1)
+parser.add_argument("--rcm", nargs=1)
+# TODO: ensure range of 2 args max
+parser.add_argument("--chip", nargs="+", type=parse_any_int)
+parser.add_argument("--download", nargs="+")
+parser.add_argument("--keyindex", type=int, default=0)
+parser.add_argument("--securedebugcontrol", type=int, default=0)
+
+args = parser.parse_args()
+
+chip_major = args.chip[0]
+chip_minor = 0
+
+key_index = args.keyindex
+secure_debug_control_flags = args.securedebugcontrol
+
+if len(args.chip) > 1:
+    chip_minor = args.chip[1]
+
+
+def handle_list_rcm(
+    xml_file_path,
+    chip_major: int,
+    chip_minor: int,
+    key_index: int,
+    secure_debug_control_flags: int,
+    dowload_args: List[str],
+):
+    xml_file_path = os.path.abspath(xml_file_path)
+    rcm_messages_path = os.path.dirname(xml_file_path)
+
+    messages = list()
+
+    # First we get the RCM version (not sure why this is needed but let's stay close to what NVIDIA do..)
+    messages.append(
+        rcm.create_rcm21_get_rcm_version(key_index, secure_debug_control_flags)
+    )
+
+    if dowload_args is not None and dowload_args[0] == "rcm" and len(dowload_args) > 1:
+        image_path = dowload_args[1]
+        load_address = None
+        entrypoint = None
+
+        if len(dowload_args) > 2:
+            load_address = dowload_args[2]
+        if len(dowload_args) > 3:
+            entrypoint = dowload_args[3]
+
+        if entrypoint is None or entrypoint == "0":
+            entrypoint = get_default_download_address(chip_major)
+        else:
+            entrypoint = parse_hex(entrypoint)
+
+        with open(image_path, "rb") as f:
+            payload = bytearray(f.read())
+
+        message = rcm.create_rcm21_download(
+            payload, entrypoint, key_index, secure_debug_control_flags
+        )
+
+        # NOTE: load address is never consumed as the bootrom doesn't support it.
+        messages.append(message)
+
+    root = ET.Element("file_list", version="1.0.0")
+
+    # Now write all messages.
+    for message_index in range(len(messages)):
+        rcm_message_name = f"rcm_{message_index}.rcm"
+        rcm_message_path = os.path.join(rcm_messages_path, rcm_message_name)
+
+        # TODO: util to map that by chip id
+        secure_offset = rcm.RCM21_RCM_MESSAGE_SECURE_START
+        secure_size = len(messages[message_index]) - secure_offset
+
+        file_element = ET.SubElement(
+            root,
+            "file",
+            name=rcm_message_name,
+            offset=str(secure_offset),
+            length=str(secure_size),
+            id=str(message_index),
+            type="rcm",
+        )
+
+        ET.SubElement(
+            file_element,
+            "sbk",
+            encrypt="1",
+            sign="1",
+            encrypt_file=f"rcm_{message_index}_encrypt.rcm",
+            hash=f"rcm_{message_index}.hash",
+        )
+        ET.SubElement(
+            file_element,
+            "pkc",
+            signature=f"rcm_{message_index}.sig",
+            signed_file=f"rcm_{message_index}_signed.rcm",
+        )
+
+        with open(rcm_message_path, "wb") as f:
+            f.write(messages[message_index])
+
+    ET.indent(root, space="\t")
+    ET.ElementTree(root).write(xml_file_path, encoding="UTF-8", xml_declaration=True)
+
+
+def handle_update_sig(xml_file_path, chip_major: int, chip_minor: int):
+    rcm_messages_path = os.path.dirname(xml_file_path)
+    tree = ET.parse(xml_file_path)
+    root = tree.getroot()
+
+    for files in root:
+        sbk_element = files.find("sbk")
+
+        if sbk_element is None:
+            continue
+
+        sbk_info = sbk_element.attrib
+
+        if "encrypt_file" in sbk_info:
+            rcm_message_path = os.path.join(rcm_messages_path, sbk_info["encrypt_file"])
+
+            with open(rcm_message_path, "rb") as f:
+                rcm_message = bytearray(f.read())
+
+            if "hash" in sbk_info:
+                with open(os.path.join(rcm_messages_path, sbk_info["hash"]), "rb") as f:
+                    hash_data = f.read()
+
+                rcm_message[
+                    rcm.RCM21_RCM_MESSAGE_CMAC_HASH_OFFSET : rcm.RCM21_RCM_MESSAGE_CMAC_HASH_OFFSET
+                    + 0x10
+                ] = hash_data
+
+                with open(rcm_message_path, "wb") as f:
+                    f.write(rcm_message)
+
+
+def handle_rcm(xml_file_path, chip_major: int, chip_minor: int):
+    dev = usb.core.find(idVendor=0x0955, idProduct=0x7721)
+
+    # was it found?
+    if dev is None:
+        raise ValueError("Device not found")
+
+    # First we need to read the device BR_CID
+
+    br_cid = rcm_read_br_cid(dev)
+
+    print(f"BR_CID: {br_cid}")
+
+    rcm_messages_path = os.path.dirname(xml_file_path)
+    tree = ET.parse(xml_file_path)
+    root = tree.getroot()
+
+    for files in root:
+        sbk_element = files.find("sbk")
+
+        if sbk_element is None:
+            continue
+
+        sbk_info = sbk_element.attrib
+
+        if "encrypt_file" in sbk_info:
+            rcm_message_path = os.path.join(rcm_messages_path, sbk_info["encrypt_file"])
+
+            with open(rcm_message_path, "rb") as f:
+                rcm_message = f.read()
+
+            message_id = rcm.get_rcm21_message_id(
+                rcm_message[0 : rcm.RCM21_RCM_MESSAGE_SIZE]
+            )
+
+            result = rcm_transfer_message(dev, rcm_message)
+
+            if result == -1:
+                print(f'USB error on "{rcm_message_path}"')
+                sys.exit(1)
+
+            if message_id == rcm.RCM21_GET_RCM_VERSION_ID:
+                print(f"RCM version {result:x}")
+
+                if result != rcm.RCM21_RCM_VERSION:
+                    print(f"RCM version mismatch! (expected {rcm.RCM21_RCM_VERSION:x})")
+                    sys.exit(1)
+            elif result != 0:
+                print(f'RCM error {result} from "{rcm_message_path}"')
+                sys.exit(1)
+
+
+if args.listrcm is not None:
+    handle_list_rcm(
+        args.listrcm[0],
+        chip_major,
+        chip_minor,
+        key_index,
+        secure_debug_control_flags,
+        args.download,
+    )
+elif args.updatesig is not None:
+    handle_update_sig(args.updatesig[0], chip_major, chip_minor)
+elif args.rcm is not None:
+    handle_rcm(args.rcm[0], chip_major, chip_minor)
+else:
+    raise Exception("TODO")
